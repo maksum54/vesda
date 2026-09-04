@@ -35,6 +35,12 @@ Create a production build:
 npm run build
 ```
 
+## Deploy to Vercel
+
+Connect this repository in Vercel and keep the project root at the repository root. The included `vercel.json` runs the production build and publishes the static export from `dist/client`.
+
+If a production URL shows Vercel's `404: NOT_FOUND`, verify that the domain is assigned to the latest production deployment under **Project Settings → Domains**. To make the site publicly accessible, disable **Vercel Authentication** for Production under **Project Settings → Deployment Protection**.
+
 ## Engineering disclaimer
 
 This repository is an engineering prototype and calculation-assistance tool. It is not a product listing, approval, certification, or substitute for current manufacturer-approved pipe-network calculation software. Final designs must be checked against current product documentation, the code edition adopted for the project, installation conditions, and the authority having jurisdiction (AHJ).

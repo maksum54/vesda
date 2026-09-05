@@ -252,6 +252,27 @@ body {
 }
 
 /* World-coordinate editor. Geometry is projected in TypeScript, never CSS tilted. */
+.ed-branch{display:flex;justify-content:space-between;align-items:center;border:1px solid var(--ed-line);padding:10px 12px;border-radius:8px;text-align:left;}
+.ed-branch small{display:block;color:var(--muted-foreground);font-size:12px;margin-top:4px;}
+.ed-branch.is-active{border-color:#0891b2;background:color-mix(in oklab,var(--background) 92%,#06b6d4);}
+.ed-segment-list{display:flex;flex-wrap:wrap;gap:8px;}
+.ed-segment-list label{display:flex;gap:6px;align-items:center;font-size:12px;padding:6px;background:var(--muted);border-radius:6px;}
+.ed-recommendation{font-size:13px;color:#047857;padding:10px;background:#10b98112;border-radius:8px;}
+.ed-input-error{color:#dc2626;font-size:12px;}
+.ed-coverage{pointer-events:none;}
+.ed-coverage path{fill:#84b34d18;stroke:#80a94d66;stroke-width:1;}
+.ed-coverage line{stroke:#b4534980;stroke-width:1;stroke-dasharray:3 3;}
+.ed-scene-iso{background:#eef3f1!important;background-image:none!important;}
+.dark .ed-scene-iso{background:#17262c!important;}
+.ed-scene-iso .ed-floor{fill:#c9d1cb;stroke:#9ca9a0;}
+.dark .ed-scene-iso .ed-floor{fill:#283d3c;stroke:#48615c;}
+.ed-scene-iso .ed-route{stroke-width:3.5;filter:drop-shadow(0 1px 1px #52272233);}
+.ed-scene-iso .ed-route.is-focus{stroke-width:4;}
+.ed-scene-iso .ed-grid-line{stroke:#9eafa377;}
+.ed-scene-iso .ed-pipe-shadow{stroke:#57645b16;stroke-width:6;}
+.ed-scene-iso .ed-svg-label{font-size:12px;stroke:#eef3f1;stroke-width:2.5;fill:#25352c;}
+.dark .ed-scene-iso .ed-svg-label{fill:#eef3f1;stroke:#17262c;}
+.ed-tee-dot{fill:var(--background);stroke:#dc2626;stroke-width:2;}
 .ed-app {
   height: 100dvh;
   min-height: 760px;

@@ -11,6 +11,18 @@ export type Pipe = {
   enabled: boolean;
   vertices: Vec3[];
   holes: Hole[];
+  branches?: Branch[];
+};
+export type Attachment = {
+  parentId: string;
+  segment: number;
+  fraction: number;
+};
+export type Branch = Attachment & {
+  id: string;
+  name: string;
+  vertices: Vec3[];
+  holes: Hole[];
 };
 export type Detector = {
   id: string;
@@ -22,6 +34,7 @@ export type Detector = {
 export type Design = {
   version: 2;
   standard?: string;
+  samplingSpacing?: number;
   room: {
     name: string;
     width: number;
@@ -39,6 +52,7 @@ export const MODELS = [
     name: 'VESDA-E VEP · 4 pipe',
     ports: 4,
     linear: 280,
+    branched: 560,
     holes: 100,
     source:
       'https://xtralis.com/product/165/vesda-e-vep-aspirating-smoke-detector',
@@ -48,6 +62,7 @@ export const MODELS = [
     name: 'VESDA-E VEP · 1 pipe',
     ports: 1,
     linear: 100,
+    branched: 130,
     holes: 45,
     source:
       'https://xtralis.com/product/165/vesda-e-vep-aspirating-smoke-detector',
@@ -57,6 +72,7 @@ export const MODELS = [
     name: 'VESDA-E VEU · 4 pipe',
     ports: 4,
     linear: 400,
+    branched: 800,
     holes: 100,
     source: 'https://xtralis.com/file/10310',
   },
@@ -65,6 +81,7 @@ export const MODELS = [
     name: 'VESDA-E VES · 4 sector',
     ports: 4,
     linear: 280,
+    branched: 560,
     holes: 100,
     source: 'https://xtralis.com/file/10310',
   },
@@ -77,12 +94,178 @@ export const distance = (a: Vec3, b: Vec3) =>
 export const clamp = (n: number, low: number, high: number) =>
   Math.max(low, Math.min(high, n));
 export const round = (n: number) => Math.round(n * 1000) / 1000;
-export const pathFor = (d: Detector, p: Pipe): Vec3[] => [
-  d.position,
-  ...p.vertices,
-];
+export function pathFor(
+  d: Detector,
+  p: Pipe,
+  branchId = 'main',
+  visited = new Set<string>(),
+): Vec3[] {
+  if (branchId === 'main') return [d.position, ...p.vertices];
+  if (visited.has(branchId)) throw new Error('Cyclic branch');
+  visited.add(branchId);
+  const b = p.branches?.find((b) => b.id === branchId);
+  if (!b) throw new Error('Missing branch');
+  const parent = pathFor(d, p, b.parentId, visited);
+  return [holePosition(parent, { ...b, diameter: 0, flow: 0 }), ...b.vertices];
+}
+export function routesFor(d: Detector, p: Pipe) {
+  return [
+    {
+      key: 'main',
+      name: 'A',
+      vertices: p.vertices,
+      holes: p.holes,
+      path: pathFor(d, p),
+    },
+    ...(p.branches ?? []).map((b) => ({
+      ...b,
+      key: b.id,
+      path: pathFor(d, p, b.id),
+    })),
+  ];
+}
+export const pipeHoleCount = (p: Pipe) =>
+  p.holes.length + (p.branches ?? []).reduce((s, b) => s + b.holes.length, 0);
+export function resizeRoom(
+  design: Design,
+  axis: 'width' | 'length' | 'height',
+  value: number,
+): Design {
+  const key = axis === 'width' ? 'x' : axis === 'length' ? 'y' : 'z',
+    ratio = value / design.room[axis];
+  const scale = (p: Vec3) => ({ ...p, [key]: round(p[key] * ratio) });
+  return {
+    ...design,
+    room: { ...design.room, [axis]: value },
+    detectors: design.detectors.map((d) => ({
+      ...d,
+      position: scale(d.position),
+      pipes: d.pipes.map((p) => ({
+        ...p,
+        vertices: p.vertices.map(scale),
+        branches: p.branches?.map((b) => ({
+          ...b,
+          vertices: b.vertices.map(scale),
+        })),
+      })),
+    })),
+  };
+}
+export function parseNumeric(
+  text: string,
+  min: number,
+  max: number,
+): number | null {
+  const trimmed = text.trim().replace(',', '.');
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n >= min && n <= max ? n : null;
+}
+export function recommendHoles(
+  path: Vec3[],
+  segments: number[],
+  spacing: number,
+) {
+  return segments.reduce(
+    (n, i) =>
+      n + Math.max(1, Math.ceil(distance(path[i], path[i + 1]) / spacing)),
+    0,
+  );
+}
+export function distributeHoles(
+  path: Vec3[],
+  segments: number[],
+  count: number,
+): Hole[] {
+  const valid = segments.filter(
+    (i) => path[i + 1] && distance(path[i], path[i + 1]) > 0.001,
+  );
+  if (!valid.length || count < valid.length) return [];
+  const sizes = valid.map((i) => distance(path[i], path[i + 1])),
+    allocation = valid.map(() => 1);
+  for (let n = valid.length; n < count; n++) {
+    let index = 0;
+    for (let i = 1; i < valid.length; i++)
+      if (sizes[i] / allocation[i] > sizes[index] / allocation[index])
+        index = i;
+    allocation[index]++;
+  }
+  return valid.flatMap((segment, i) =>
+    Array.from({ length: allocation[i] }, (_, j) => ({
+      id: uid(),
+      segment,
+      fraction: (j + 0.5) / allocation[i],
+      diameter: 3,
+      flow: 2.7,
+    })),
+  );
+}
 export function lengthOf(path: Vec3[]) {
   return path.slice(1).reduce((sum, v, i) => sum + distance(path[i], v), 0);
+}
+// Preserve the original orthogonal constraints instead of introducing a diagonal
+// when moving a bend. An inlet/tee anchor stays fixed when editing downstream nodes.
+export function movePolylineNode(
+  path: Vec3[],
+  index: number,
+  next: Vec3,
+  lockStart = true,
+): Vec3[] {
+  const result = path.map((p) => ({ ...p }));
+  for (const axis of ['x', 'y', 'z'] as const) {
+    const connected = new Set([index]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let i = 0; i < path.length - 1; i++)
+        if (
+          Math.abs(path[i][axis] - path[i + 1][axis]) < 0.0001 &&
+          (connected.has(i) || connected.has(i + 1))
+        ) {
+          if (!connected.has(i) || !connected.has(i + 1)) changed = true;
+          connected.add(i);
+          connected.add(i + 1);
+        }
+    }
+    if (lockStart && index !== 0 && connected.has(0)) continue;
+    const delta = next[axis] - path[index][axis];
+    for (const i of connected) result[i][axis] = round(path[i][axis] + delta);
+  }
+  return result;
+}
+export function preserveTeeAngles(
+  d: Detector,
+  before: Pipe,
+  after: Pipe,
+): Pipe {
+  const result = {
+    ...after,
+    branches: after.branches?.map((b) => ({
+      ...b,
+      vertices: b.vertices.map((v) => ({ ...v })),
+    })),
+  };
+  // Parent-first recursion also supports trees created through imported projects.
+  const done = new Set<string>();
+  const adjust = (id: string) => {
+    if (id === 'main' || done.has(id)) return;
+    done.add(id);
+    const b = result.branches?.find((b) => b.id === id),
+      old = before.branches?.find((b) => b.id === id);
+    if (!b || !old) return;
+    adjust(b.parentId);
+    const prev = pathFor(d, before, id),
+      current = pathFor(d, result, id);
+    if (distance(prev[0], current[0]) > 0.0001)
+      b.vertices = movePolylineNode(
+        [prev[0], ...b.vertices],
+        0,
+        current[0],
+        false,
+      ).slice(1);
+  };
+  result.branches?.forEach((b) => adjust(b.id));
+  return result;
 }
 export function holePosition(path: Vec3[], hole: Hole): Vec3 {
   const a = path[hole.segment] ?? path[0];
@@ -167,23 +350,28 @@ export const INITIAL_DESIGN: Design = {
             diameter: 3,
             flow: 2.7,
           })),
-        },
-        {
-          id: 2,
-          enabled: true,
-          vertices: [
-            { x: 3, y: 12, z: 4 },
-            { x: 3, y: 19, z: 4 },
-            { x: 25, y: 19, z: 4 },
+          branches: [
+            {
+              id: 'branch-b',
+              name: 'B',
+              parentId: 'main',
+              segment: 0,
+              fraction: 1,
+              vertices: [
+                { x: 3, y: 19, z: 4 },
+                { x: 25, y: 19, z: 4 },
+              ],
+              holes: [6, 12, 18].map((x, i) => ({
+                id: `b-sp-${i}`,
+                segment: 1,
+                fraction: x / 22,
+                diameter: 3,
+                flow: 2.7,
+              })),
+            },
           ],
-          holes: [6, 12, 18].map((x, i) => ({
-            id: `sp-${i + 3}`,
-            segment: 2,
-            fraction: x / 22,
-            diameter: 3,
-            flow: 2.7,
-          })),
         },
+        { id: 2, enabled: false, vertices: [], holes: [] },
         { id: 3, enabled: false, vertices: [], holes: [] },
         { id: 4, enabled: false, vertices: [], holes: [] },
       ],
@@ -191,9 +379,13 @@ export const INITIAL_DESIGN: Design = {
   ],
 };
 export function pipeStats(d: Detector, p: Pipe, room: Design['room']) {
-  const length = p.enabled ? lengthOf(pathFor(d, p)) : 0;
-  const flow = p.enabled ? p.holes.reduce((s, h) => s + h.flow, 0) : 0;
-  const values = p.holes.map((h) => h.flow),
+  const routes = routesFor(d, p),
+    holes = routes.flatMap((r) => r.holes);
+  const length = p.enabled
+    ? routes.reduce((n, r) => n + lengthOf(r.path), 0)
+    : 0;
+  const flow = p.enabled ? holes.reduce((s, h) => s + h.flow, 0) : 0;
+  const values = holes.map((h) => h.flow),
     max = Math.max(0, ...values),
     min = values.length ? Math.min(...values) : 0;
   return {
@@ -201,7 +393,7 @@ export function pipeStats(d: Detector, p: Pipe, room: Design['room']) {
     flow,
     balance: max ? (min / max) * 100 : 0,
     transport: length
-      ? (14 + length * 0.31 + p.holes.length * 0.72) *
+      ? (14 + length * 0.31 + holes.length * 0.72) *
         (1 + Math.max(0, room.altitude) / 18000)
       : 0,
   };
@@ -269,6 +461,10 @@ export function validDesign(value: unknown): value is Design {
   return (
     d.version === 2 &&
     (d.standard === undefined || typeof d.standard === 'string') &&
+    (d.samplingSpacing === undefined ||
+      (finite(d.samplingSpacing) &&
+        d.samplingSpacing >= 0.5 &&
+        d.samplingSpacing <= 20)) &&
     !!d.room &&
     typeof d.room.name === 'string' &&
     ['width', 'length', 'height', 'target'].every(
@@ -298,6 +494,7 @@ export function validDesign(value: unknown): value is Design {
             (!p.enabled || p.id <= modelFor(x.model).ports) &&
             Array.isArray(p.vertices) &&
             p.vertices.every(v3) &&
+            validBranches(x, p) &&
             Array.isArray(p.holes) &&
             p.holes.every(
               (h) =>
@@ -317,6 +514,60 @@ export function validDesign(value: unknown): value is Design {
         ),
     )
   );
+}
+
+function validBranches(d: Detector, p: Pipe) {
+  if (p.branches === undefined) return true;
+  if (!Array.isArray(p.branches) || p.branches.length > 100) return false;
+  try {
+    const ids = new Set<string>();
+    for (const b of p.branches) {
+      if (
+        !b ||
+        typeof b.id !== 'string' ||
+        b.id === 'main' ||
+        ids.has(b.id) ||
+        typeof b.name !== 'string' ||
+        typeof b.parentId !== 'string' ||
+        !Number.isInteger(b.segment) ||
+        b.segment < 0 ||
+        !Number.isFinite(b.fraction) ||
+        b.fraction < 0 ||
+        b.fraction > 1 ||
+        !Array.isArray(b.vertices) ||
+        !b.vertices.length ||
+        !Array.isArray(b.holes)
+      )
+        return false;
+      ids.add(b.id);
+      if (b.vertices.some((v) => !v || ![v.x, v.y, v.z].every(Number.isFinite)))
+        return false;
+      const parent = pathFor(d, p, b.parentId);
+      if (b.segment >= parent.length - 1) return false;
+      if (
+        b.holes.some(
+          (h) =>
+            !h ||
+            typeof h.id !== 'string' ||
+            !Number.isInteger(h.segment) ||
+            h.segment < 0 ||
+            h.segment >= b.vertices.length ||
+            !Number.isFinite(h.fraction) ||
+            h.fraction < 0 ||
+            h.fraction > 1 ||
+            !Number.isFinite(h.diameter) ||
+            h.diameter <= 0 ||
+            !Number.isFinite(h.flow) ||
+            h.flow <= 0,
+        )
+      )
+        return false;
+      pathFor(d, p, b.id);
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function nearestProjected(

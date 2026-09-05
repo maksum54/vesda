@@ -60,11 +60,20 @@ import {
   PIPE_COLORS,
   clamp,
   holePosition,
-  makeDetector,
   modelFor,
   nearestProjected,
   migrateLegacy,
   pathFor,
+  movePolylineNode,
+  preserveTeeAngles,
+  routesFor,
+  pipeHoleCount,
+  resizeRoom,
+  parseNumeric,
+  recommendHoles,
+  distributeHoles,
+  lengthOf,
+  type Attachment,
   pipeStats,
   project,
   round,
@@ -96,7 +105,7 @@ export default function EngineeringWorkspace() {
   const [dark, setDark] = useState(false),
     [lang, setLang] = useState<'ID' | 'EN'>('ID');
   const [view, setView] = useState('iso'),
-    [rotation, setRotation] = useState(0),
+    [rotation, setRotation] = useState(290),
     [zoom, setZoom] = useState(1),
     [pan, setPan] = useState({ x: 0, y: 0 });
   const [tool, setTool] = useState('select'),
@@ -107,9 +116,18 @@ export default function EngineeringWorkspace() {
     [cursor, setCursor] = useState<Vec3 | null>(null);
   const [history, setHistory] = useState<Design[]>([]),
     [future, setFuture] = useState<Design[]>([]);
-  const [rows, setRows] = useState(1),
-    [cols, setCols] = useState(1),
-    [newModel, setNewModel] = useState('vep4');
+  const [branchId, setBranchId] = useState('main');
+  const [attachment, setAttachment] = useState<Attachment | null>(null);
+  const spacing = design.samplingSpacing ?? 6;
+  const setSpacing = (value: number) => {
+    checkpoint();
+    setDesign((d) => ({ ...d, samplingSpacing: value }));
+  };
+  const [countOverride, setCountOverride] = useState<number | null>(null);
+  const [samplingSegments, setSamplingSegments] = useState<number[] | null>(
+    null,
+  );
+  const [coverage, setCoverage] = useState(true);
   const [snap, setSnap] = useState(true),
     [ortho, setOrtho] = useState(true),
     [height, setHeight] = useState(4);
@@ -130,12 +148,23 @@ export default function EngineeringWorkspace() {
   const t = (id: string, en: string) => (lang === 'ID' ? id : en);
   const active =
     design.detectors.find((d) => d.id === activeId) ?? design.detectors[0];
-  const pipe = active.pipes[pipeId - 1],
-    model = modelFor(active.model),
-    iso = view === 'iso';
-  const room = design.room,
-    path = pathFor(active, pipe),
-    stats = pipeStats(active, pipe, room);
+  const physicalPipe = active.pipes[pipeId - 1];
+  const branch = physicalPipe.branches?.find((b) => b.id === branchId);
+  const routeId = branch?.id ?? 'main',
+    routeName = branch?.name ?? 'A';
+  const pipe: Pipe = branch
+    ? { ...physicalPipe, vertices: branch.vertices, holes: branch.holes }
+    : physicalPipe;
+  const model = modelFor(active.model),
+    iso = view === 'iso',
+    room = design.room;
+  const catalogLengthLimit = active.pipes.some(
+    (p) => p.enabled && p.branches?.length,
+  )
+    ? model.branched
+    : model.linear;
+  const path = pathFor(active, physicalPipe, routeId),
+    stats = pipeStats(active, physicalPipe, room);
   const totalLength = design.detectors.reduce(
     (sum, d) =>
       sum + d.pipes.reduce((n, p) => n + pipeStats(d, p, room).length, 0),
@@ -144,7 +173,9 @@ export default function EngineeringWorkspace() {
   const totalHoles = design.detectors.reduce(
     (sum, d) =>
       sum +
-      d.pipes.filter((p) => p.enabled).reduce((n, p) => n + p.holes.length, 0),
+      d.pipes
+        .filter((p) => p.enabled)
+        .reduce((n, p) => n + pipeHoleCount(p), 0),
     0,
   );
   const enabledPipes = design.detectors.reduce(
@@ -166,6 +197,60 @@ export default function EngineeringWorkspace() {
       })
       .join(' ');
 
+  const segmentOptions = path
+    .slice(1)
+    .map((v, i) => ({
+      index: i,
+      length: Math.hypot(v.x - path[i].x, v.y - path[i].y),
+    }))
+    .filter((s) => s.length > 0.01);
+  const selectedSegments = (
+    samplingSegments ?? [
+      segmentOptions.reduce((best, s) => (s.length > best.length ? s : best), {
+        index: -1,
+        length: 0,
+      }).index,
+    ]
+  ).filter((i) => segmentOptions.some((s) => s.index === i));
+  const recommended = selectedSegments.length
+    ? recommendHoles(path, selectedSegments, spacing)
+    : 0;
+  const sampleCount = countOverride ?? recommended;
+  const startPoint = attachment
+    ? holePosition(pathFor(active, physicalPipe, attachment.parentId), {
+        ...attachment,
+        id: '',
+        diameter: 0,
+        flow: 0,
+      })
+    : (pipe.vertices.at(-1) ?? path[0]);
+  const sketchLast = draft?.at(-1) ?? startPoint;
+  function selectRoute(id: string) {
+    setBranchId(id);
+    setDraft(null);
+    setAttachment(null);
+    setCursor(null);
+    setSelection(null);
+    setSamplingSegments(null);
+    setCountOverride(null);
+  }
+  function applySampling() {
+    if (!selectedSegments.length || sampleCount < selectedSegments.length)
+      return;
+    checkpoint();
+    const holes = distributeHoles(
+      path,
+      selectedSegments,
+      Math.min(200, Math.round(sampleCount)),
+    );
+    updatePipe((p) => ({
+      ...p,
+      holes: [
+        ...p.holes.filter((h) => !selectedSegments.includes(h.segment)),
+        ...holes,
+      ],
+    }));
+  }
   function checkpoint() {
     setHistory((h) => [...h.slice(-39), structuredClone(design)]);
     setFuture([]);
@@ -176,34 +261,48 @@ export default function EngineeringWorkspace() {
       detectors: d.detectors.map((x) => (x.id === id ? fn(x) : x)),
     }));
   }
-  function updatePipe(fn: (p: Pipe) => Pipe) {
+  function updatePhysical(fn: (p: Pipe) => Pipe) {
     updateDetector((d) => ({
       ...d,
-      pipes: d.pipes.map((p) => (p.id === pipeId ? fn(p) : p)),
+      pipes: d.pipes.map((p) =>
+        p.id === pipeId ? (ortho ? preserveTeeAngles(d, p, fn(p)) : fn(p)) : p,
+      ),
     }));
+  }
+  function updatePipe(fn: (p: Pipe) => Pipe) {
+    updatePhysical((p) => {
+      const b = p.branches?.find((b) => b.id === routeId);
+      if (!b) return fn(p);
+      const next = fn({ ...p, vertices: b.vertices, holes: b.holes });
+      return {
+        ...p,
+        enabled: next.enabled,
+        branches: p.branches?.map((x) =>
+          x.id === routeId
+            ? { ...x, vertices: next.vertices, holes: next.holes }
+            : x,
+        ),
+      };
+    });
   }
   function chooseDetector(id: string) {
     setActiveId(id);
     setPipeId(1);
+    selectRoute('main');
     setSelection({ kind: 'detector' });
     setDraft(null);
     setCursor(null);
   }
   function chooseTool(next: string) {
     setTool(next);
+    setAttachment(null);
     setDraft(null);
     setCursor(null);
     gesture.current = null;
     svg.current?.focus();
   }
-  const nextDetectorNumber = () =>
-    Math.max(
-      0,
-      ...design.detectors.map((d) =>
-        Number(d.name.match(/^ASD-(\d+)$/)?.[1] ?? 0),
-      ),
-    ) + 1;
   function undo() {
+    setAttachment(null);
     if (draft) {
       setDraft(null);
       return;
@@ -215,6 +314,7 @@ export default function EngineeringWorkspace() {
     setSelection(null);
   }
   function redo() {
+    setAttachment(null);
     if (!future.length) return;
     setHistory((h) => [...h, design]);
     setDesign(future[0]);
@@ -225,11 +325,28 @@ export default function EngineeringWorkspace() {
   function finish() {
     if (!draft?.length) return;
     checkpoint();
-    updatePipe((p) => ({
-      ...p,
-      enabled: true,
-      vertices: [...p.vertices, ...draft],
-    }));
+    if (attachment) {
+      const id = uid(),
+        name = Array.from({ length: 101 }, (_, i) =>
+          i < 25 ? String.fromCharCode(66 + i) : `B${i + 1}`,
+        ).find((n) => !physicalPipe.branches?.some((b) => b.name === n))!;
+      updatePhysical((p) => ({
+        ...p,
+        branches: [
+          ...(p.branches ?? []),
+          { id, name, ...attachment, vertices: draft, holes: [] },
+        ],
+      }));
+      setBranchId(id);
+      setSamplingSegments(null);
+      setCountOverride(null);
+    } else
+      updatePipe((p) => ({
+        ...p,
+        enabled: true,
+        vertices: [...p.vertices, ...draft],
+      }));
+    setAttachment(null);
     setDraft(null);
     setCursor(null);
     setTool('select');
@@ -255,59 +372,63 @@ export default function EngineeringWorkspace() {
     };
   }
   function sketchPoint(p: Vec3): Vec3 {
-    const last = draft?.at(-1) ?? pipe.vertices.at(-1) ?? active.position;
+    const last = sketchLast;
     if (!ortho) return p;
     return Math.abs(p.x - last.x) >= Math.abs(p.y - last.y)
       ? { ...p, y: last.y }
       : { ...p, x: last.x };
   }
-  function addDetectorGrid() {
-    if (design.detectors.length + rows * cols > 64) {
+  function placeDetector(v: Vec3) {
+    checkpoint();
+    updateDetector((d) => ({ ...d, position: { ...v, z: d.position.z } }));
+    chooseTool('select');
+  }
+  function startTee(clientX: number, clientY: number) {
+    if ((physicalPipe.branches?.length ?? 0) >= 100) {
+      setMessage(
+        t('Maksimum 100 cabang per pipe.', 'Maximum 100 branches per pipe.'),
+      );
+      return;
+    }
+    if (!physicalPipe.enabled) {
       setMessage(
         t(
-          'Maksimum 64 detector per proyek.',
-          'Maximum 64 detectors per project.',
+          'Aktifkan pipe sebelum membuat tee.',
+          'Enable the pipe before adding a tee.',
         ),
       );
       return;
     }
-    checkpoint();
-    const additions: Detector[] = [];
-    for (let r = 0; r < rows; r++)
-      for (let c = 0; c < cols; c++)
-        additions.push(
-          makeDetector(
-            uid(),
-            newModel,
-            {
-              x: round((room.width * (c + 1)) / (cols + 1)),
-              y: round((room.length * (r + 1)) / (rows + 1)),
-              z: 1.5,
-            },
-            `ASD-${String(nextDetectorNumber() + additions.length).padStart(2, '0')}`,
-          ),
-        );
-    setDesign((d) => ({ ...d, detectors: [...d.detectors, ...additions] }));
-    chooseDetector(additions[0].id);
+    const matrix = world.current?.getScreenCTM();
+    if (!matrix) return;
+    const screen = new DOMPoint(clientX, clientY).matrixTransform(
+      matrix.inverse(),
+    );
+    const hits = routesFor(active, physicalPipe)
+      .map((r) => ({ ...nearestProjected(r.path, screen, pp), route: r }))
+      .sort((a, b) => a.distance - b.distance);
+    const hit = hits[0];
+    if (!hit || hit.distance > 18 / zoom) {
+      setMessage(
+        t('Klik pipa untuk lokasi tee.', 'Click a pipe for the tee location.'),
+      );
+      return;
+    }
+    setAttachment({
+      parentId: hit.route.key,
+      segment: hit.segment,
+      fraction: hit.fraction,
+    });
+    setHeight(hit.point.z);
+    setDraft([]);
+    setTool('pipe');
+    setCursor(null);
     setMessage(
       t(
-        `${additions.length} detector ditambahkan. Semua dapat digeser.`,
-        `${additions.length} detectors added. Drag each to position.`,
+        'Tee dipilih. Sketsa cabang lalu Enter.',
+        'Tee selected. Sketch the branch then Enter.',
       ),
     );
-  }
-  function addAt(v: Vec3, modelId = newModel) {
-    if (design.detectors.length >= 64) return;
-    checkpoint();
-    const d = makeDetector(
-      uid(),
-      modelId,
-      { ...v, z: Math.min(1.5, room.height) },
-      `ASD-${String(nextDetectorNumber()).padStart(2, '0')}`,
-    );
-    setDesign((s) => ({ ...s, detectors: [...s.detectors, d] }));
-    chooseDetector(d.id);
-    chooseTool('select');
   }
   function projectedHit(clientX: number, clientY: number) {
     const matrix = world.current?.getScreenCTM();
@@ -362,7 +483,9 @@ export default function EngineeringWorkspace() {
       return;
     }
     const v = pointAt(e.clientX, e.clientY, height);
-    if (tool === 'detector') addAt(pointAt(e.clientX, e.clientY, 1.5));
+    if (tool === 'detector')
+      placeDetector(pointAt(e.clientX, e.clientY, active.position.z));
+    else if (tool === 'tee') startTee(e.clientX, e.clientY);
     else if (tool === 'sample') addHole(e.clientX, e.clientY);
     else if (tool === 'pipe') {
       if (!pipe.enabled) {
@@ -372,7 +495,7 @@ export default function EngineeringWorkspace() {
         return;
       }
       const next = sketchPoint(v),
-        last = draft?.at(-1) ?? pipe.vertices.at(-1) ?? active.position;
+        last = sketchLast;
       const vertical =
         Math.abs(last.z - next.z) > 0.001 ? { ...last, z: next.z } : null;
       const additions = [
@@ -412,7 +535,9 @@ export default function EngineeringWorkspace() {
     if (g.kind === 'vertex')
       updatePipe((p) => ({
         ...p,
-        vertices: p.vertices.map((x, i) => (i === g.index ? v : x)),
+        vertices: ortho
+          ? movePolylineNode([path[0], ...p.vertices], g.index + 1, v).slice(1)
+          : p.vertices.map((x, i) => (i === g.index ? v : x)),
       }));
     if (g.kind === 'hole') {
       const hit = projectedHit(e.clientX, e.clientY);
@@ -454,9 +579,25 @@ export default function EngineeringWorkspace() {
   }
   function deletePipe() {
     checkpoint();
-    updatePipe((p) => ({ ...p, vertices: [], holes: [] }));
-    setSelection(null);
-    setDraft(null);
+    if (routeId === 'main')
+      updatePhysical((p) => ({ ...p, vertices: [], holes: [], branches: [] }));
+    else {
+      const removed = new Set([routeId]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const b of physicalPipe.branches ?? [])
+          if (removed.has(b.parentId) && !removed.has(b.id)) {
+            removed.add(b.id);
+            changed = true;
+          }
+      }
+      updatePhysical((p) => ({
+        ...p,
+        branches: p.branches?.filter((b) => !removed.has(b.id)),
+      }));
+    }
+    selectRoute('main');
     setDialog(null);
     chooseTool('pipe');
   }
@@ -464,7 +605,9 @@ export default function EngineeringWorkspace() {
     const capacity = modelFor(id).ports;
     if (
       active.pipes.some(
-        (p) => p.id > capacity && (p.vertices.length || p.holes.length),
+        (p) =>
+          p.id > capacity &&
+          (p.vertices.length || pipeHoleCount(p) || p.branches?.length),
       )
     ) {
       setMessage(
@@ -489,30 +632,18 @@ export default function EngineeringWorkspace() {
     key: 'width' | 'length' | 'height' | 'target' | 'altitude',
     value: number,
   ) {
-    const axis =
-      key === 'width'
-        ? 'x'
-        : key === 'length'
-          ? 'y'
-          : key === 'height'
-            ? 'z'
-            : null;
-    const locations = design.detectors.flatMap((d) => [
-      d.position,
-      ...d.pipes.flatMap((p) => p.vertices),
-    ]);
-    if (axis && locations.some((p) => p[axis] > value)) {
+    selectRoute(routeId);
+    checkpoint();
+    if (key === 'width' || key === 'length' || key === 'height') {
+      setDesign((d) => resizeRoom(d, key, value));
+      if (key === 'height') setHeight((h) => Math.min(h, value));
       setMessage(
         t(
-          'Ukuran tidak boleh lebih kecil dari jaringan yang ada.',
-          'Room dimensions cannot be smaller than the existing network.',
+          'Ruangan diubah; jaringan mengikuti skala ruangan.',
+          'Room changed; network scaled with the room.',
         ),
       );
-      return;
-    }
-    checkpoint();
-    setDesign((d) => ({ ...d, room: { ...d.room, [key]: value } }));
-    if (key === 'height') setHeight((h) => Math.min(h, value));
+    } else setDesign((d) => ({ ...d, room: { ...d.room, [key]: value } }));
   }
   useEffect(() => {
     // Restore after hydration; wait until restoration finishes before autosaving.
@@ -580,6 +711,7 @@ export default function EngineeringWorkspace() {
       }
       if (e.key === 'Escape') {
         setDraft(null);
+        setAttachment(null);
         setSelection(null);
         setTool('select');
       }
@@ -590,6 +722,7 @@ export default function EngineeringWorkspace() {
       const shortcuts: Record<string, string> = {
         v: 'select',
         p: 'pipe',
+        t: 'tee',
         s: 'sample',
         d: 'detector',
         h: 'pan',
@@ -631,7 +764,7 @@ export default function EngineeringWorkspace() {
           p.id,
           p.enabled ? 'Yes' : 'No',
           round(s.length),
-          p.holes.length,
+          pipeHoleCount(p),
           round(s.flow),
           round(s.transport),
         ]);
@@ -664,33 +797,34 @@ export default function EngineeringWorkspace() {
       ['Detector', 'Pipe', 'Vertex', 'X (m)', 'Y (m)', 'Z (m)'],
     ];
     for (const d of design.detectors)
-      for (const p of d.pipes) {
-        p.holes.forEach((h, i) => {
-          const v = holePosition(pathFor(d, p), h);
-          holes.push([
-            d.name,
-            p.id,
-            p.enabled ? 'Yes' : 'No',
-            `SP-${i + 1}`,
-            round(v.x),
-            round(v.y),
-            round(v.z),
-            h.diameter,
-            h.flow,
-          ]);
-        });
-        pathFor(d, p).forEach((v, i) => {
-          if (p.vertices.length)
-            vertices.push([
+      for (const p of d.pipes)
+        for (const r of routesFor(d, p)) {
+          r.holes.forEach((h, i) => {
+            const v = holePosition(r.path, h);
+            holes.push([
               d.name,
               p.id,
-              i,
+              p.enabled ? 'Yes' : 'No',
+              `${r.name}/SP-${i + 1}`,
               round(v.x),
               round(v.y),
               round(v.z),
+              h.diameter,
+              h.flow,
             ]);
-        });
-      }
+          });
+          r.path.forEach((v, i) => {
+            if (r.vertices.length)
+              vertices.push([
+                d.name,
+                p.id,
+                `${r.name}/${i}`,
+                round(v.x),
+                round(v.y),
+                round(v.z),
+              ]);
+          });
+        }
     const bom: Array<Array<string | number>> = [
       ['Item', 'Quantity', 'Unit'],
       ...MODELS.map((m) => [
@@ -700,6 +834,18 @@ export default function EngineeringWorkspace() {
       ]),
       ['Pipe Ø25 mm', round(totalLength), 'm'],
       ['Sampling holes', totalHoles, 'pcs'],
+      [
+        'Tee fittings',
+        design.detectors.reduce(
+          (n, d) =>
+            n +
+            d.pipes
+              .filter((p) => p.enabled)
+              .reduce((s, p) => s + (p.branches?.length ?? 0), 0),
+          0,
+        ),
+        'pcs',
+      ],
     ];
     const summary = [
       ['Project', room.name],
@@ -759,7 +905,7 @@ export default function EngineeringWorkspace() {
       y = 18;
       line('ISOMETRIC NETWORK', 14);
       const plot = (v: Vec3) => {
-        const p = project(v, room, true, 0);
+        const p = project(v, room, true, 290);
         return { x: p.x * 0.19 + 12, y: p.y * 0.19 + 35 };
       };
       const corners = [
@@ -778,16 +924,18 @@ export default function EngineeringWorkspace() {
       for (const d of design.detectors) {
         for (const p of d.pipes.filter((p) => p.enabled)) {
           doc.setDrawColor(PIPE_COLORS[p.id - 1]);
-          const vs = pathFor(d, p);
-          vs.slice(1).forEach((v, i) => {
-            const a = plot(vs[i]),
-              b = plot(v);
-            doc.line(a.x, a.y, b.x, b.y);
-          });
-          p.holes.forEach((h) => {
-            const v = plot(holePosition(vs, h));
-            doc.circle(v.x, v.y, 0.7);
-          });
+          for (const r of routesFor(d, p)) {
+            const vs = r.path;
+            vs.slice(1).forEach((v, i) => {
+              const a = plot(vs[i]),
+                b = plot(v);
+              doc.line(a.x, a.y, b.x, b.y);
+            });
+            r.holes.forEach((h) => {
+              const v = plot(holePosition(vs, h));
+              doc.circle(v.x, v.y, 0.7);
+            });
+          }
         }
         const v = plot(d.position);
         doc.setTextColor(30);
@@ -805,15 +953,16 @@ export default function EngineeringWorkspace() {
         for (const p of d.pipes.filter((p) => p.enabled)) {
           const s = pipeStats(d, p, room);
           line(
-            `Pipe ${p.id}: ${s.length.toFixed(2)} m / ${p.holes.length} holes / ${s.flow.toFixed(2)} L/min / ~${s.transport.toFixed(1)} s`,
+            `Pipe ${p.id}: ${s.length.toFixed(2)} m / ${pipeHoleCount(p)} holes / ${s.flow.toFixed(2)} L/min / ~${s.transport.toFixed(1)} s`,
           );
-          p.holes.forEach((h, i) => {
-            const v = holePosition(pathFor(d, p), h);
-            line(
-              `SP-${i + 1}  X ${v.x.toFixed(2)} Y ${v.y.toFixed(2)} Z ${v.z.toFixed(2)} m | hole ${h.diameter} mm | entered flow ${h.flow} L/min`,
-              8,
-            );
-          });
+          for (const r of routesFor(d, p))
+            r.holes.forEach((h, i) => {
+              const v = holePosition(r.path, h);
+              line(
+                `${r.name}/SP-${i + 1}  X ${v.x.toFixed(2)} Y ${v.y.toFixed(2)} Z ${v.z.toFixed(2)} m | hole ${h.diameter} mm | entered flow ${h.flow} L/min`,
+                8,
+              );
+            });
         }
       }
       doc.save('asd-network-report.pdf');
@@ -841,18 +990,14 @@ export default function EngineeringWorkspace() {
       'V',
     ],
     ['pipe', <Route key="pipe" />, t('Sketsa pipa', 'Sketch pipe'), 'P'],
+    ['tee', <Plus key="tee" />, t('Cabang tee', 'Tee branch'), 'T'],
     [
       'sample',
       <CircleDot key="sample" />,
       t('Titik sampling', 'Sampling point'),
       'S',
     ],
-    [
-      'detector',
-      <Box key="detector" />,
-      t('Tambah detector', 'Add detector'),
-      'D',
-    ],
+    ['detector', <Box key="detector" />, t('Pindahkan ASD', 'Move ASD'), 'D'],
     ['pan', <Hand key="pan" />, t('Geser tampilan', 'Pan view'), 'H'],
   ];
   return (
@@ -976,38 +1121,136 @@ export default function EngineeringWorkspace() {
         <aside className="ed-sidebar bg-card border-r">
           <div className="ed-section">
             <div className="ed-section-heading">
-              <span>{t('Perangkat', 'Devices')}</span>
-              <b>{design.detectors.length}</b>
+              <span>{t('Ruangan / ASD', 'Room / ASD')}</span>
+              <Box size={16} />
             </div>
             <p className="ed-help">
               {t(
-                'Atur jumlah dengan baris × kolom, kemudian geser bebas di denah.',
-                'Set rows × columns, then freely position each detector.',
+                'Satu ASD untuk ruangan ini. Pilih model dan geser posisinya pada denah.',
+                'One ASD for this room. Select a model and drag its position.',
               )}
             </p>
-            <ModelSelect value={newModel} onChange={setNewModel} />
-            <div className="ed-two">
-              <NumberField
-                label={t('Baris', 'Rows')}
-                value={rows}
-                min={1}
-                max={8}
-                step={1}
-                onChange={(n) => setRows(Math.round(n))}
-              />
-              <NumberField
-                label={t('Kolom', 'Columns')}
-                value={cols}
-                min={1}
-                max={8}
-                step={1}
-                onChange={(n) => setCols(Math.round(n))}
-              />
-            </div>
-            <Button className="w-full" onClick={addDetectorGrid}>
-              <Plus />
-              {t('Tambah', 'Add')} {rows * cols} detector
+            <ModelSelect value={active.model} onChange={changeModel} />
+            <Button variant="outline" onClick={() => setDialog('room')}>
+              {t('Ukuran ruangan', 'Room dimensions')} · {room.width} ×{' '}
+              {room.length} m
             </Button>
+          </div>
+          <div className="ed-section">
+            <div className="ed-section-heading">
+              <span>
+                Pipe {pipeId} · {t('Cabang', 'Branches')}
+              </span>
+            </div>
+            {routesFor(active, physicalPipe).map((r) => (
+              <button
+                key={r.key}
+                className={
+                  r.key === routeId ? 'ed-branch is-active' : 'ed-branch'
+                }
+                onClick={() => selectRoute(r.key)}
+              >
+                <span>
+                  <strong>
+                    {t('Cabang', 'Branch')} {r.name}
+                  </strong>
+                  <small>
+                    {lengthOf(r.path).toFixed(1)} m · {r.holes.length} SP
+                  </small>
+                </span>
+                <Route size={16} />
+              </button>
+            ))}
+            <Button
+              variant="outline"
+              disabled={!physicalPipe.vertices.length || !pipe.enabled}
+              onClick={() => chooseTool('tee')}
+            >
+              <Plus />
+              {t('Cabang tee', 'Tee branch')}
+            </Button>
+            <p className="ed-help">
+              {t(
+                'Pilih Cabang tee, klik titik pada pipa, lalu sketsa cabang baru.',
+                'Choose Tee branch, click a point on the pipe, then sketch the new branch.',
+              )}
+            </p>
+          </div>
+          <div className="ed-section">
+            <div className="ed-section-heading">
+              <span>
+                {t('Sampling cabang', 'Branch sampling')} {routeName}
+              </span>
+              <CircleDot size={16} />
+            </div>
+            <p className="ed-help">
+              {t(
+                'Pilih bagian pipa yang akan diberi sampling.',
+                'Select pipe sections to receive sampling points.',
+              )}
+            </p>
+            <div className="ed-segment-list">
+              {segmentOptions.map((s) => (
+                <label key={s.index}>
+                  <input
+                    type="checkbox"
+                    checked={selectedSegments.includes(s.index)}
+                    onChange={(e) => {
+                      setSamplingSegments(
+                        e.target.checked
+                          ? [...selectedSegments, s.index]
+                          : selectedSegments.filter((i) => i !== s.index),
+                      );
+                      setCountOverride(null);
+                    }}
+                  />{' '}
+                  S{s.index + 1} · {s.length.toFixed(1)} m
+                </label>
+              ))}
+            </div>
+            <NumberField
+              label={t(
+                'Target jarak sampling (m)',
+                'Target sample spacing (m)',
+              )}
+              value={spacing}
+              min={0.5}
+              max={20}
+              onChange={(v) => {
+                setSpacing(v);
+                setCountOverride(null);
+              }}
+            />
+            <div className="ed-recommendation">
+              {t('Rekomendasi awal', 'Initial recommendation')}:{' '}
+              <strong>
+                {recommended} {t('titik', 'points')}
+              </strong>
+            </div>
+            <NumberField
+              label={t('Jumlah titik — dapat diubah', 'Point count — editable')}
+              value={sampleCount}
+              min={0}
+              max={200}
+              step={1}
+              onChange={(v) => setCountOverride(Math.round(v))}
+            />
+            <Button
+              disabled={
+                !pipe.enabled ||
+                !selectedSegments.length ||
+                sampleCount < selectedSegments.length
+              }
+              onClick={applySampling}
+            >
+              {t('Terapkan ke bagian terpilih', 'Apply to selected sections')}
+            </Button>
+            <p className="ed-help">
+              {t(
+                'Mengganti titik pada bagian terpilih; Undo tersedia. Rekomendasi jarak adalah tata letak awal, bukan verifikasi cakupan NFPA.',
+                'Replaces samples on selected sections; Undo is available. Spacing is a preliminary layout, not NFPA coverage verification.',
+              )}
+            </p>
           </div>
           <div className="ed-device-list">
             {design.detectors.map((d) => (
@@ -1045,19 +1288,14 @@ export default function EngineeringWorkspace() {
             </div>
             <p className="ed-help">
               {t(
-                'Drag model ke denah untuk menambah detector.',
-                'Drag a model onto the drawing to add a detector.',
+                'Pilih model untuk ruangan ini.',
+                'Choose a model for this room.',
               )}
             </p>
             {MODELS.map((m) => (
-              <div
-                key={m.id}
-                className="ed-catalog-item"
-                draggable
-                onDragStart={(e) => e.dataTransfer.setData('asd/model', m.id)}
-              >
+              <div key={m.id} className="ed-catalog-item">
                 <Box size={16} />
-                <span>{m.name}</span>
+                <button onClick={() => changeModel(m.id)}>{m.name}</button>
                 <a
                   href={m.source}
                   target="_blank"
@@ -1164,7 +1402,7 @@ export default function EngineeringWorkspace() {
                 onClick={() => {
                   setZoom(1);
                   setPan({ x: 0, y: 0 });
-                  setRotation(0);
+                  setRotation(290);
                 }}
               >
                 <RotateCcw />
@@ -1186,6 +1424,7 @@ export default function EngineeringWorkspace() {
                   }
                   onClick={() => {
                     setPipeId(id);
+                    selectRoute('main');
                     setSelection(null);
                     setDraft(null);
                     setCursor(null);
@@ -1205,7 +1444,7 @@ export default function EngineeringWorkspace() {
             </div>
           </div>
           <div
-            className="ed-canvas"
+            className={`ed-canvas ${iso ? 'ed-scene-iso' : ''}`}
             onDragOver={(e) => e.preventDefault()}
             onDrop={(e) => {
               e.preventDefault();
@@ -1219,8 +1458,7 @@ export default function EngineeringWorkspace() {
                   updateDetector((x) => ({ ...x, position: v }), id);
                   chooseDetector(id);
                 }
-              } else if (MODELS.some((x) => x.id === m))
-                addAt(pointAt(e.clientX, e.clientY, 1.5), m);
+              } else if (MODELS.some((x) => x.id === m)) changeModel(m);
             }}
           >
             <div className="ed-float-tools bg-card border">
@@ -1262,10 +1500,10 @@ export default function EngineeringWorkspace() {
                 </Button>
               </div>
             )}
-          <svg
-            ref={svg}
-            role="application"
-            tabIndex={-1}
+            <svg
+              ref={svg}
+              role="application"
+              tabIndex={-1}
               viewBox="0 0 960 600"
               className={`ed-drawing tool-${tool}`}
               aria-label={t(
@@ -1337,33 +1575,67 @@ export default function EngineeringWorkspace() {
                     className="ed-grid-line"
                   />
                 ))}
-                {iso && (
-                  <g className="ed-room-frame">
-                    <path
-                      d={svgPath(
-                        [...bounds, bounds[0]].map((p) => ({
-                          ...p,
-                          z: room.height,
-                        })),
-                      )}
-                    />
-                    {bounds.map((p, i) => (
-                      <path
-                        key={i}
-                        d={svgPath([p, { ...p, z: room.height }])}
-                      />
-                    ))}
-                  </g>
-                )}
+                {coverage &&
+                  design.detectors.map((d) =>
+                    d.pipes
+                      .filter((p) => p.enabled)
+                      .flatMap((p) =>
+                        routesFor(d, p).flatMap((r) =>
+                          r.holes.map((h) => {
+                            const v = holePosition(r.path, h),
+                              at = pp(v),
+                              base = pp({ ...v, z: 0 });
+                            const ring = Array.from({ length: 49 }, (_, i) => ({
+                              x:
+                                v.x +
+                                (Math.cos((i * Math.PI) / 24) * spacing) / 2,
+                              y:
+                                v.y +
+                                (Math.sin((i * Math.PI) / 24) * spacing) / 2,
+                              z: 0,
+                            }));
+                            return (
+                              <g key={h.id} className="ed-coverage">
+                                <path d={svgPath(ring)} />
+                                {iso && (
+                                  <line
+                                    x1={at.x}
+                                    y1={at.y}
+                                    x2={base.x}
+                                    y2={base.y}
+                                  />
+                                )}
+                              </g>
+                            );
+                          }),
+                        ),
+                      ),
+                  )}
                 {design.detectors.map((d) => (
                   <g key={d.id}>
                     {d.pipes
-                      .filter((p) => p.enabled && p.vertices.length)
+                      .filter((p) => p.enabled)
+                      .flatMap((p) =>
+                        routesFor(d, p)
+                          .filter((r) => r.vertices.length)
+                          .map((r) => ({
+                            ...p,
+                            vertices: r.vertices,
+                            holes: r.holes,
+                            route: r,
+                          })),
+                      )
                       .map((p) => {
-                        const vertices = pathFor(d, p),
-                          focus = d.id === active.id && p.id === pipeId;
+                        const vertices = p.route.path,
+                          focus =
+                            d.id === active.id &&
+                            p.id === pipeId &&
+                            p.route.key === routeId;
                         return (
-                          <g key={p.id} opacity={focus ? 1 : 0.55}>
+                          <g
+                            key={`${p.id}-${p.route.key}`}
+                            opacity={iso || focus ? 1 : 0.65}
+                          >
                             {iso && (
                               <path
                                 d={svgPath(
@@ -1374,17 +1646,48 @@ export default function EngineeringWorkspace() {
                             )}
                             <path
                               d={svgPath(vertices)}
-                              stroke={PIPE_COLORS[p.id - 1]}
+                              stroke={iso ? '#c62828' : PIPE_COLORS[p.id - 1]}
                               className={`ed-route ${focus ? 'is-focus' : ''}`}
                               onPointerDown={(e) => {
                                 if (tool === 'select') {
                                   e.stopPropagation();
                                   setActiveId(d.id);
                                   setPipeId(p.id);
+                                  selectRoute(p.route.key);
                                   setSelection(null);
                                 }
                               }}
                             />
+                            {p.route.key !== 'main' && (
+                              <circle
+                                cx={pp(vertices[0]).x}
+                                cy={pp(vertices[0]).y}
+                                r={5}
+                                className="ed-tee-dot"
+                              />
+                            )}
+                            {focus &&
+                              tool === 'select' &&
+                              vertices.slice(1).map((v, i) => {
+                                const a = vertices[i];
+                                if (Math.hypot(v.x - a.x, v.y - a.y) < 0.01)
+                                  return null;
+                                const mid = pp({
+                                  x: (v.x + a.x) / 2,
+                                  y: (v.y + a.y) / 2,
+                                  z: (v.z + a.z) / 2,
+                                });
+                                return (
+                                  <text
+                                    key={i}
+                                    x={mid.x}
+                                    y={mid.y + 18}
+                                    className="ed-svg-label"
+                                  >
+                                    S{i + 1}
+                                  </text>
+                                );
+                              })}
                             {vertices.length > 1 && (
                               <text
                                 x={pp(vertices[vertices.length - 1]).x + 10}
@@ -1392,7 +1695,8 @@ export default function EngineeringWorkspace() {
                                 className="ed-svg-label"
                                 fill={PIPE_COLORS[p.id - 1]}
                               >
-                                {d.name} / P{p.id}
+                                Pipe {p.route.name} ·{' '}
+                                {lengthOf(vertices).toFixed(1)} m
                               </text>
                             )}
                             {p.holes.map((h, i) => {
@@ -1407,6 +1711,7 @@ export default function EngineeringWorkspace() {
                                       e.stopPropagation();
                                       setActiveId(d.id);
                                       setPipeId(p.id);
+                                      selectRoute(p.route.key);
                                       begin(
                                         e,
                                         { kind: 'hole', id: h.id, z: v.z },
@@ -1559,10 +1864,7 @@ export default function EngineeringWorkspace() {
                 })}
                 {draft && (
                   <path
-                    d={svgPath([
-                      pipe.vertices.at(-1) ?? active.position,
-                      ...draft,
-                    ])}
+                    d={svgPath([startPoint, ...draft])}
                     className="ed-route ed-draft"
                     stroke={PIPE_COLORS[pipeId - 1]}
                   />
@@ -1570,7 +1872,10 @@ export default function EngineeringWorkspace() {
                 {tool === 'pipe' && cursor && pipe.enabled && (
                   <path
                     d={svgPath([
-                      draft?.at(-1) ?? pipe.vertices.at(-1) ?? active.position,
+                      sketchLast,
+                      ...(Math.abs(sketchLast.z - cursor.z) > 0.001
+                        ? [{ ...sketchLast, z: cursor.z }]
+                        : []),
                       cursor,
                     ])}
                     className="ed-preview"
@@ -1612,20 +1917,25 @@ export default function EngineeringWorkspace() {
                       'Klik untuk belokan · Enter selesai · Esc batal',
                       'Click bends · Enter finish · Esc cancel',
                     )
-                  : tool === 'sample'
+                  : tool === 'tee'
                     ? t(
-                        'Klik pada rute pipa aktif untuk titik sampling',
-                        'Click the active pipe route to add a sampling point',
+                        'Klik garis pipa untuk lokasi tee.',
+                        'Click the pipe line for the tee location.',
                       )
-                    : tool === 'detector'
+                    : tool === 'sample'
                       ? t(
-                          'Klik denah untuk menambah detector',
-                          'Click the drawing to add a detector',
+                          'Klik pada rute pipa aktif untuk titik sampling',
+                          'Click the active pipe route to add a sampling point',
                         )
-                      : t(
-                          'Geser detector, node pipa, atau titik sampling',
-                          'Drag detectors, pipe nodes, or sampling points',
-                        )}
+                      : tool === 'detector'
+                        ? t(
+                            'Klik denah untuk memindahkan ASD',
+                            'Click the drawing to move the ASD',
+                          )
+                        : t(
+                            'Geser detector, node pipa, atau titik sampling',
+                            'Drag detectors, pipe nodes, or sampling points',
+                          )}
               </span>
               {draft && (
                 <Button size="sm" onClick={finish}>
@@ -1635,6 +1945,14 @@ export default function EngineeringWorkspace() {
             </div>
           </div>
           <div className="ed-options bg-card border-y">
+            <label htmlFor="ed-coverage">
+              <Switch
+                id="ed-coverage"
+                checked={coverage}
+                onCheckedChange={setCoverage}
+              />
+              {t('Area ilustrasi', 'Illustrative area')}
+            </label>
             <label htmlFor="ed-snap">
               <Switch id="ed-snap" checked={snap} onCheckedChange={setSnap} />
               Snap 0.25 m
@@ -1647,22 +1965,14 @@ export default function EngineeringWorkspace() {
               />
               {t('Siku 90°', 'Orthogonal')}
             </label>
-            <label>
-              Z{' '}
-              <Input
-                aria-label={t('Elevasi sketsa (m)', 'Sketch elevation (m)')}
-                type="number"
-                min={0}
-                max={room.height}
-                step={0.25}
-                value={height}
-                onChange={(e) => {
-                  const n = Number(e.target.value);
-                  if (Number.isFinite(n)) setHeight(clamp(n, 0, room.height));
-                }}
-              />
-              m
-            </label>
+            <NumberField
+              label="Z (m)"
+              value={height}
+              min={0}
+              max={room.height}
+              step={0.25}
+              onChange={setHeight}
+            />
             {floor && (
               <button
                 onClick={() => {
@@ -1685,7 +1995,9 @@ export default function EngineeringWorkspace() {
                 {active.name} / Pipe {pipeId} ·{' '}
                 {t('Daftar titik sampling', 'Sampling schedule')}
               </span>
-              <span>{pipe.holes.length} points</span>
+              <span>
+                {pipe.holes.length} points · {t('Cabang', 'Branch')} {routeName}
+              </span>
             </div>
             <div className="ed-table-scroll">
               <table>
@@ -1764,7 +2076,7 @@ export default function EngineeringWorkspace() {
             <div className="ed-three">
               {(['x', 'y', 'z'] as const).map((axis) => (
                 <NumberField
-                  key={axis}
+                  key={`${active.id}-${axis}`}
                   label={`${axis.toUpperCase()} (m)`}
                   value={active.position[axis]}
                   min={0}
@@ -1785,30 +2097,6 @@ export default function EngineeringWorkspace() {
                 />
               ))}
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={design.detectors.length <= 1}
-              onClick={() => {
-                checkpoint();
-                setDesign((d) => ({
-                  ...d,
-                  detectors: d.detectors.filter((x) => x.id !== active.id),
-                }));
-                chooseDetector(
-                  design.detectors.find((x) => x.id !== active.id)!.id,
-                );
-              }}
-            >
-              <Trash2 />
-              {t('Hapus detector', 'Delete detector')}
-            </Button>
-            <p className="ed-help">
-              {t(
-                'Menghapus detector beserta pipanya. Dapat dibatalkan dengan Undo.',
-                'Deletes this detector and its pipes. Undo is available.',
-              )}
-            </p>
           </div>
           <div className="ed-section">
             <div className="ed-section-heading">
@@ -1839,7 +2127,7 @@ export default function EngineeringWorkspace() {
               />
               <Metric
                 label={t('Titik sampling', 'Sampling points')}
-                value={String(pipe.holes.length)}
+                value={String(pipeHoleCount(physicalPipe))}
                 unit=""
               />
               <Metric
@@ -1887,7 +2175,7 @@ export default function EngineeringWorkspace() {
                 <div className="ed-three">
                   {(['x', 'y', 'z'] as const).map((axis) => (
                     <NumberField
-                      key={axis}
+                      key={`${routeId}-${selection.index}-${axis}`}
                       label={`${axis.toUpperCase()} (m)`}
                       value={currentVertex[axis]}
                       min={0}
@@ -1902,9 +2190,15 @@ export default function EngineeringWorkspace() {
                         checkpoint();
                         updatePipe((p) => ({
                           ...p,
-                          vertices: p.vertices.map((x, i) =>
-                            i === selection.index ? { ...x, [axis]: v } : x,
-                          ),
+                          vertices: ortho
+                            ? movePolylineNode(
+                                [path[0], ...p.vertices],
+                                selection.index + 1,
+                                { ...p.vertices[selection.index], [axis]: v },
+                              ).slice(1)
+                            : p.vertices.map((x, i) =>
+                                i === selection.index ? { ...x, [axis]: v } : x,
+                              ),
                         }));
                       }}
                     />
@@ -1914,6 +2208,7 @@ export default function EngineeringWorkspace() {
               {currentHole && (
                 <>
                   <NumberField
+                    key={`${currentHole.id}-diameter`}
                     label={t('Diameter lubang (mm)', 'Hole diameter (mm)')}
                     value={currentHole.diameter}
                     min={0.5}
@@ -1930,6 +2225,7 @@ export default function EngineeringWorkspace() {
                     }}
                   />
                   <NumberField
+                    key={`${currentHole.id}-flow`}
                     label={t('Asumsi aliran (L/min)', 'Assumed flow (L/min)')}
                     value={currentHole.flow}
                     min={0.01}
@@ -1973,9 +2269,9 @@ export default function EngineeringWorkspace() {
                 active.pipes
                   .filter((p) => p.enabled)
                   .reduce((n, p) => n + pipeStats(active, p, room).length, 0) <=
-                model.linear
+                catalogLengthLimit
               }
-              text={`${t('Batas total linear katalog', 'Catalog total linear limit')} ${model.linear} m`}
+              text={`${t('Batas panjang katalog', 'Catalog length limit')} ${catalogLengthLimit} m`}
             />
             <p className="ed-help">
               {t(
@@ -2029,8 +2325,8 @@ export default function EngineeringWorkspace() {
                 ? t('Pengaturan proyek', 'Project settings')
                 : dialog === 'delete'
                   ? t(
-                      `Hapus ${active.name} / Pipe ${pipeId}?`,
-                      `Delete ${active.name} / Pipe ${pipeId}?`,
+                      `Hapus ${active.name} / Pipe ${pipeId} / ${routeName}?`,
+                      `Delete ${active.name} / Pipe ${pipeId} / ${routeName}?`,
                     )
                   : t(
                       'Perbandingan target transport',
@@ -2040,8 +2336,8 @@ export default function EngineeringWorkspace() {
             <DialogDescription>
               {dialog === 'delete'
                 ? t(
-                    'Rute dan titik pada pipe ini dihapus. Undo tersedia.',
-                    'This pipe route and its sampling points will be deleted. Undo is available.',
+                    'Rute terpilih, titik sampling dan cabang turunannya dihapus. Undo tersedia.',
+                    'The selected route, its samples and child branches will be deleted. Undo is available.',
                   )
                 : t(
                     'Parameter proyek dan estimasi awal.',
@@ -2191,21 +2487,61 @@ function NumberField({
   step?: number;
   onChange: (n: number) => void;
 }) {
+  const [editing, setEditing] = useState<string | null>(null),
+    [error, setError] = useState(false);
+  const text = editing ?? String(value);
+  const commit = () => {
+    if (editing === null) return;
+    const n = parseNumeric(editing, min, max);
+    if (n === null) {
+      setError(true);
+      return;
+    }
+    onChange(n);
+    setEditing(null);
+    setError(false);
+  };
   return (
     <label className="ed-field">
       <span>{label}</span>
       <Input
-        type="number"
-        value={value}
-        min={min}
-        max={max}
-        step={step}
+        type="text"
+        inputMode="decimal"
+        value={text}
+        aria-invalid={error}
+        onFocus={(e) => {
+          setEditing(String(value));
+          e.currentTarget.select();
+        }}
         onChange={(e) => {
-          if (e.target.value === '') return;
-          const n = Number(e.target.value);
-          if (Number.isFinite(n)) onChange(clamp(n, min, max));
+          setEditing(e.target.value);
+          setError(false);
+        }}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            commit();
+          }
+          if (e.key === 'Escape') {
+            setEditing(null);
+            setError(false);
+          }
+          if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+            e.preventDefault();
+            const n = parseNumeric(text, min, max) ?? value;
+            onChange(
+              round(clamp(n + (e.key === 'ArrowUp' ? step : -step), min, max)),
+            );
+            setEditing(null);
+          }
         }}
       />
+      {error && (
+        <small className="ed-input-error">
+          {min} – {max} · 14,5 / 14.5
+        </small>
+      )}
     </label>
   );
 }
